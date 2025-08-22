@@ -1,32 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-HAR Replay (GUI + CLI) — main page + HTML URL rewriting
+HAR Replay (GUI + CLI) — main page + HTML URL rewriting (safe)
 - 自動把 HAR 內第 1 個 HTML 主頁掛在 "/"
-- 重寫 HTML 裡的絕對網址到本機，讓資源會打到這台回放伺服器
+- 「保守改寫」：只改寫 HAR 內「確實存在本體」的絕對網址，避免空白頁
 - 友善 GUI：版本號、作者、簡易說明、預設啟動自動開瀏覽器
-- 隱藏的進階憑證設定（預設看不到，需要時再展開）
+- 隱藏的進階憑證設定（預設不顯示，勾選才展開）
 - 兩個圖片位子：視窗 icon（app.ico / app.png）、GUI 橫幅（banner.png）
+- 除了 /__list，再提供 /__debug 與 /__set_home?path=...（可手動指定首頁 HTML）
 - PyInstaller -F 打包相容（resource_path）
 
 Created on Mon Feb  3 09:25:57 2025
 最後更新：2025-08-21
 作者（__author__）：Chiakai
-版本（__version__）：20250821.01
+版本（__version__）：20250822.01
 """
 
 import argparse
 import base64
 import json
 import os
+import re
 import ssl
 import sys
 import threading
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 __author__  = "Chiakai"
-__version__ = "20250821.01"
+__version__ = "20250821.02"
 
 # ------------ 資源路徑（支援 PyInstaller 單檔） ------------
 
@@ -54,7 +56,9 @@ def load_har(har_path):
     maps = {'by_full': {}, 'by_path_qs': {}}
     url_list = []
     origins = set()
-    main_path_qs = None  # 我們要掛到 "/"
+    main_path_qs = None               # 我們要掛到 "/"
+    rewrite_map = set()               # 「確實收錄到本體」的「完整絕對 URL」
+    html_candidates = []              # 所有 text/html 的 path_qs（供切換首頁）
 
     for e in entries:
         req = e.get('request', {}) or {}
@@ -97,10 +101,15 @@ def load_har(har_path):
         maps['by_path_qs'][(method, path_qs)] = rec
         url_list.append(url)
 
-        # 挑第一個 HTML 主頁當 / （GET + 200 + text/html）
-        if (main_path_qs is None and method == 'GET' and status == 200):
-            ct = headers.get('content-type', '')
-            if 'text/html' in ct.lower():
+        # 收錄 rewrite_map：只記「GET 且 body 不為空」的完整絕對 URL
+        if method == 'GET' and url and body:
+            rewrite_map.add(url)
+
+        # 記錄 HTML 候選
+        ct = headers.get('content-type', '')
+        if method == 'GET' and status == 200 and 'text/html' in ct.lower():
+            html_candidates.append(path_qs)
+            if main_path_qs is None:
                 main_path_qs = path_qs
 
     return {
@@ -108,38 +117,51 @@ def load_har(har_path):
         'url_list': url_list,
         'origins': origins,
         'main_path_qs': main_path_qs,
+        'rewrite_map': rewrite_map,
+        'html_candidates': html_candidates,
     }
 
-# ---------- 簡單 HTML 重寫（把絕對網址改成本機） ----------
+# ---------- 保守 HTML 重寫（只改寫確定可回放的 URL） ----------
 
-def rewrite_html(body_bytes, server_scheme, server_port, origins):
-    # 嘗試以 utf-8 解碼（失敗就不改）
-    try:
-        html = body_bytes.decode('utf-8')
-    except Exception:
+def rewrite_html(body_bytes, server_scheme, server_port, origins, rewrite_map):
+    # 嘗試解碼
+    html = None
+    for enc in ('utf-8', 'latin-1'):
         try:
-            html = body_bytes.decode('latin-1')
+            html = body_bytes.decode(enc)
+            break
         except Exception:
-            return body_bytes
+            continue
+    if html is None:
+        return body_bytes
 
     server_base = f"{server_scheme}://localhost:{server_port}"
-    host_base = f"//localhost:{server_port}"
 
-    # 1) https://example.com/... -> http(s)://localhost:PORT/...
-    for origin in origins:
-        html = html.replace(origin, server_base)
+    # 1) 逐條把「完整絕對 URL」改成本機 path（只改我們真的有的）
+    #    e.g. https://host/a/b?c -> http://localhost:3000/a/b?c
+    #    用簡單 replace 足夠；避免誤把子字串替換，可先切出 path_qs
+    for full_url in list(rewrite_map):
+        u = urlsplit(full_url)
+        path_qs = u.path + (('?' + u.query) if u.query else '')
+        replacement = f"{server_base}{path_qs}"
+        html = html.replace(full_url, replacement)
 
-    # 2) //example.com/... -> //localhost:PORT/...
-    for origin in origins:
-        o = urlsplit(origin)
-        html = html.replace(f"//{o.netloc}", host_base)
+    # 2) 可選：協定相對（//host/...）的改寫僅針對 rewrite_map 出現過的 host
+    #    這段採保守策略，盡量不動第三方外站（如未在 rewrite_map 出現，就不改）
+    seen_hosts = {urlsplit(u).netloc for u in rewrite_map}
+    for host in list(seen_hosts):
+        # 把 "... //host/xxx" 改成 "http(s)://localhost:PORT/xxx"
+        pattern = re.compile(r'(?P<prefix>["\'(])//' + re.escape(host) + r'(?P<path>/[^"\'\s)]+)')
+        def _sub(m):
+            return m.group('prefix') + f"{server_base}{m.group('path')}"
+        html = pattern.sub(_sub, html)
 
     return html.encode('utf-8')
 
 # ---------- HTTP Handler ----------
 
 class HarHandler(BaseHTTPRequestHandler):
-    ctx = None  # {'maps', 'url_list', 'origins', 'main_path_qs'}
+    ctx = None  # {'maps', 'url_list', 'origins', 'main_path_qs', 'rewrite_map', 'html_candidates'}
     server_port = None
 
     def do_GET(self): self._serve()
@@ -151,28 +173,74 @@ class HarHandler(BaseHTTPRequestHandler):
         maps = ctx['maps']
         url_list = ctx['url_list']
         origins = ctx['origins']
+        rewrite_map = ctx.get('rewrite_map', set())
         main_path_qs = ctx['main_path_qs']
+        html_candidates = ctx.get('html_candidates', [])
 
         method = self.command.upper()
         path_qs = self.path
 
-        # 工具頁
-        if path_qs == "/__list":
+        # 工具：__list
+        if path_qs.startswith("/__list"):
             self.send_response(200)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.end_headers()
             link_main = '<p><a href="/">開啟主頁（/）</a></p>' if main_path_qs else "<p>未找到 HTML 主頁。</p>"
+            # 提供切換首頁的連結
+            cand_html = ""
+            if html_candidates:
+                cand_html = "<h3>HTML 候選：</h3><ul>" + "".join(
+                    f'<li><code>{c}</code> — <a href="/__set_home?path={c}">設為首頁</a></li>'
+                    for c in html_candidates
+                ) + "</ul>"
             html = (
                 f"<h1>HAR URLs</h1><p>版本 {__version__} ｜ 作者 {__author__}</p>"
-                + link_main +
+                + link_main + cand_html +
+                "<h3>所有請求 URL（原始絕對網址）：</h3>"
                 "<ul>" + "".join(f"<li>{u}</li>" for u in url_list) + "</ul>"
             )
             self.wfile.write(html.encode("utf-8"))
             return
 
+        # 工具：__debug
+        if path_qs.startswith("/__debug"):
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            stats = {
+                "main_path_qs": main_path_qs,
+                "rewrite_map_count": len(rewrite_map),
+                "html_candidates_count": len(html_candidates),
+                "origins": list(origins),
+                "port": self.server_port,
+                "version": __version__,
+            }
+            pretty = json.dumps(stats, ensure_ascii=False, indent=2)
+            html = f"<h1>Debug</h1><pre>{pretty}</pre><p><a href='/__list'>返回 __list</a></p>"
+            self.wfile.write(html.encode("utf-8"))
+            return
+
+        # 工具：__set_home?path=...
+        if path_qs.startswith("/__set_home"):
+            qs = ""
+            if "?" in path_qs:
+                qs = path_qs.split("?", 1)[1]
+            params = parse_qs(qs or "")
+            new_home = (params.get("path") or [""])[0]
+            if new_home and (('GET', new_home) in maps['by_path_qs']):
+                ctx['main_path_qs'] = new_home
+                msg = f"已設定首頁為：{new_home}"
+            else:
+                msg = f"無法設定首頁，找不到：{new_home}"
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(f"<h1>{msg}</h1><p><a href='/'>回首頁</a>｜<a href='/__list'>回清單</a></p>".encode("utf-8"))
+            return
+
         # 把 "/" 對應到 HAR 裡的主頁
-        if path_qs == "/" and main_path_qs:
-            rec = maps['by_path_qs'].get((method, main_path_qs))
+        if path_qs == "/" and ctx['main_path_qs']:
+            rec = maps['by_path_qs'].get((method, ctx['main_path_qs']))
         else:
             # 先用 path+query 找
             rec = maps['by_path_qs'].get((method, path_qs))
@@ -198,12 +266,12 @@ class HarHandler(BaseHTTPRequestHandler):
         headers = rec['headers']
         body = rec['body']
 
-        # 如是 HTML，改寫絕對網址成本機
+        # 如是 HTML，做保守改寫
         ct = headers.get('content-type', '')
         is_tls = isinstance(self.server.socket, ssl.SSLSocket)
         scheme = 'https' if is_tls else 'http'
         if 'text/html' in (ct or '').lower():
-            body = rewrite_html(body, scheme, self.server_port, origins)
+            body = rewrite_html(body, scheme, self.server_port, origins, rewrite_map)
 
         self.send_response(status)
         if ct: self.send_header('content-type', ct)
@@ -261,7 +329,7 @@ def start_gui():
         def __init__(self):
             super().__init__()
             self.title(f"HAR Replay  v{__version__}  —  by {__author__}")
-            self.geometry("620x430")
+            self.geometry("640x460")
             self.resizable(False, False)
 
             # 設定視窗 icon（優先 .ico，沒有就用 .png）
@@ -275,7 +343,7 @@ def start_gui():
                             self.iconphoto(True, PhotoImage(file=p))
                         break
                     except Exception:
-                        pass  # 沒關係，顯示不到就跳過
+                        pass  # 顯示不到就跳過
 
             self.httpd = None
             self.srv_thread = None
@@ -283,20 +351,20 @@ def start_gui():
 
             # ===== 上方：簡單說明 + 橫幅圖 =====
             top = ttk.Frame(self); top.pack(fill="x", padx=12, pady=(10,4))
-            
+
             banner_path = resource_path(BANNER_FILE)
             self._banner_img = None
             if os.path.isfile(banner_path):
                 try:
                     self._banner_img = PhotoImage(file=banner_path)
-                    ttk.Label(top, image=self._banner_img).pack(anchor="c", pady=(6,20))
+                    ttk.Label(top, image=self._banner_img).pack(anchor="c", pady=(6,14))
                 except Exception:
                     pass
-            
+
             intro = (
                 "這是一個簡單的 HAR 回放工具：\n"
                 "1) 選擇 .har 檔 → 2) 按「啟動」→ 3) 瀏覽器會自動打開主頁（/）\n"
-                "※ HAR 是請求/回應紀錄，無法保證 100% 重播；搭配螢幕錄影最穩妥。"
+                "※ HAR 是請求/回應紀錄，無法保證 100% 重播；建議搭配螢幕錄影最穩妥。"
             )
             ttk.Label(top, text=intro, foreground="#333").pack(anchor="w")
 
@@ -315,8 +383,20 @@ def start_gui():
             # ===== 進階（憑證）— 預設隱藏 =====
             adv_hdr = ttk.Frame(self); adv_hdr.pack(fill="x", padx=12, pady=(6,0))
             self.show_adv = tk.BooleanVar(value=False)
-            ttk.Checkbutton(adv_hdr, text="顯示進階設定（HTTPS 憑證）", variable=self.show_adv, command=self.toggle_adv)\
-                .pack(anchor="w")
+            ttk.Checkbutton(
+                adv_hdr,
+                text="顯示進階設定（HTTPS 憑證）",
+                variable=self.show_adv,
+                command=self.toggle_adv
+            ).pack(anchor="w")
+
+            # 進階標頭之後，新增一行右側資訊
+            meta = ttk.Frame(self); meta.pack(fill="x", padx=12, pady=(2,0))
+            ttk.Label(
+                meta,
+                text=f"臺中市政府警察局刑事警察大隊科技犯罪偵查隊  ｜   作者：{__author__}  ｜   版本：{__version__}",
+                foreground="#555"
+            ).pack(side="right")
 
             self.adv = ttk.Frame(self); self.adv.pack(fill="x", padx=12, pady=(0,6))
             ttk.Label(self.adv, text="Cert：").grid(row=0, column=0, sticky="w")
@@ -335,7 +415,7 @@ def start_gui():
 
             # ===== 控制列 =====
             ctrl = ttk.Frame(self); ctrl.pack(fill="x", padx=12, pady=10)
-            
+
             ttk.Button(ctrl, text="關於我", command=self.open_portfolio).pack(side="left", padx=(6,0))
             ttk.Button(ctrl, text="回饋表單", command=self.open_feedback).pack(side="left")
 
@@ -392,7 +472,7 @@ def start_gui():
 
             def on_ready(scheme):
                 self.scheme = scheme
-                self.status_var.set(f"伺服器已啟動：{scheme}://localhost:{port}   （主頁：/ ；清單：/__list）")
+                self.status_var.set(f"伺服器已啟動：{scheme}://localhost:{port}   （主頁：/ ；清單：/__list；偵錯：/__debug）")
                 self.btn_start.configure(state="disabled")
                 self.btn_stop.configure(state="normal")
                 self.btn_open.configure(state="normal")
@@ -458,7 +538,7 @@ def main():
     out = run_server(args.har, port=args.port, cert=args.cert, key=args.key)
     if out is None: sys.exit(1)
     httpd, t, scheme = out
-    print(f"[HAR Replay v{__version__}] Serving on {scheme}://localhost:{args.port}  (open /  or  /__list)")
+    print(f"[HAR Replay v{__version__}] Serving on {scheme}://localhost:{args.port}  (/ , /__list , /__debug)")
     try:
         t.join()
     except KeyboardInterrupt:
