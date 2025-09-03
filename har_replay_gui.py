@@ -1,42 +1,58 @@
 # -*- coding: utf-8 -*-
 """
-HAR Replay (GUI + CLI) — list-first + table UI + compose views + Base HTML + Forensics helper
-- 預設開啟「回放清單」：專業、易懂的表格（時間 / 路徑 / 預覽）
-- 「最終合成」兩種模式：外聯補資源（ext=on）/ 純本機（ext=off）
-- 依時間（新→舊）直接預覽，點即開新分頁
-- 支援「基底快照（Base HTML）」：用 DOM 快照作為主頁基礎，再補 HAR 資源
-- 內建取證教學 + 一鍵複製 DOM 指令 + 從剪貼簿存成 HTML
-- ThreadingHTTPServer + timeouts → 停止更快
-- 保守改寫 + 外聯模式切換
-- 友善 GUI：版本號、作者、簡易說明、預設啟動自動開清單
-- 進階憑證（預設隱藏）
-- 視窗 icon（app.ico / app.png）、GUI 橫幅（banner.png）
-- PyInstaller -F 打包相容（resource_path）
+HAR Replay Pro (整合版) — Evidence-Grade Replayer
+Version: 2025.09.03-pro1
+整合作者: Gemini (Google AI)
+原始作者: Chiakai (GUI), ChatGPT (Backend)
 
-作者（__author__）：Chiakai
-版本（__version__）：20250823.01
+本版本整合了以下兩份腳本的優點：
+- har_replay_gui.py: 友善的 Tkinter GUI、取證教學、剪貼簿工具。
+- har_replay_gui_v2_gui.py: 強健的後端邏輯，包含內容雜湊、BS4解析、SPA偵測與證據匯出。
+
+特色：
+- 專業 GUI 介面，內建現場取證 SOP 教學。
+- 基於內容雜湊 (SHA256) 管理資源，無重複儲存，符合取證精神。
+- 使用 BeautifulSoup (bs4) 解析 HTML，大幅提高資源路徑改寫的準確度。
+- 偵測 SPA 空殼頁面，並在合成時給予提示。
+- 一鍵匯出為標準化的「證據包」(Evidence Bundle)，包含報告與雜湊值。
+- 清單頁顯示每個時間點的「離線可見度」與「JS 命中率」，評估 HAR 完整性。
 """
-
+import os, sys, json, base64, re, hashlib, html, mimetypes, datetime as dt, threading, webbrowser
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, quote, unquote, urlunparse
+from pathlib import Path
 import argparse
-import base64
-import html
-import json
-import os
-import re
-import ssl
-import sys
-import threading
-import webbrowser
-from datetime import datetime
-from urllib.parse import urlsplit, parse_qs
 
-from socketserver import ThreadingMixIn
-from http.server import HTTPServer, BaseHTTPRequestHandler
+# --- 整合 v1 的相依性 ---
+import gzip, zlib
+try:
+    import brotli as _brotli
+except ImportError:
+    _brotli = None
 
+# --- 版本與作者資訊 ---
+__version__ = "2025.09.03-pro1"
+#__author__  = "Gemini (Integrator), Chiakai (GUI), ChatGPT (Backend)"
 __author__  = "Chiakai"
-__version__ = "20250823.01"
+UNIT_STR = "臺中市政府警察局刑事警察大隊科技犯罪偵查隊"
 
-# ------------ 資源路徑（支援 PyInstaller 單檔） ------------
+
+# ---------- Optional deps & Timezone (整合自 v2) ----------
+try:
+    from bs4 import BeautifulSoup
+    _HAS_BS4 = True
+except ImportError:
+    _HAS_BS4 = False
+    print("[警告] 未安裝 `beautifulsoup4`，HTML 解析將退回正則表達式模式，還原度可能下降。")
+    print("[提示] 請執行: pip install beautifulsoup4")
+
+try:
+    from zoneinfo import ZoneInfo
+    _TZ_TAIPEI = ZoneInfo("Asia/Taipei")
+except ImportError:
+    _TZ_TAIPEI = dt.timezone(dt.timedelta(hours=8))
+
+# ---------- 資源路徑 (for PyInstaller, from v1) ----------
 def resource_path(relative_path: str) -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path)
@@ -44,496 +60,577 @@ def resource_path(relative_path: str) -> str:
 APP_ICON_CANDIDATES = ["app.ico", "app.png"]  # 視窗 icon 任一存在就用
 BANNER_FILE = "banner.png"                     # GUI 橫幅圖（選填）
 
-# ---------- 讀取 HAR & 建索引 ----------
-def parse_started_dt(entry):
-    dt_str = (entry.get("startedDateTime") or "").strip()
+# ---------- 通用工具函式 (整合 v1 & v2) ----------
+def utc_to_taipei(iso_str: str) -> str:
+    if not iso_str: return ""
     try:
-        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        s = iso_str.replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(s)
+        if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(_TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return None
+        return iso_str
 
-def load_har(har_path):
-    with open(har_path, 'rb') as f:
-        har = json.load(f)
+def iso_norm(iso_str: str) -> str:
+    try:
+        s = iso_str.replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(s)
+        if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return iso_str
 
-    entries = har.get('log', {}).get('entries', [])
-    maps = {'by_full': {}, 'by_path_qs': {}}
-    url_list = []
-    origins = set()
-    rewrite_map = set()
-    html_entries = []   # [(started_dt, path_qs, full_url, status, content_type, body_len, origin)]
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-    # 以「主要網域」推測主頁（啟發式：以最大量的 HTML 來源網域）
-    domain_count = {}
+def md5_bytes(b: bytes) -> str:
+    return hashlib.md5(b).hexdigest()
 
-    for e in entries:
-        req = e.get('request', {}) or {}
-        res = e.get('response', {}) or {}
-        url = req.get('url', '') or ''
-        method = (req.get('method') or 'GET').upper()
-        u = urlsplit(url)
-        path_qs = u.path + (('?' + u.query) if u.query else '')
-        started_dt = parse_started_dt(e)
-        origin = f"{u.scheme}://{u.netloc}" if (u.scheme and u.netloc) else ""
+def guess_mime(url_path: str, fallback="application/octet-stream") -> str:
+    mime, _ = mimetypes.guess_type(url_path)
+    # 修正 .js 常被誤判的問題 (from v1)
+    if (url_path or "").lower().endswith('.js'):
+        return 'application/javascript'
+    return mime or fallback
 
-        if origin:
-            origins.add(origin)
+def ensure_text(b: bytes) -> str:
+    try:
+        return b.decode("utf-8", errors="replace")
+    except Exception:
+        return b.decode("latin-1", errors="replace")
 
-        # body
-        content = res.get('content', {}) or {}
-        text = content.get('text')
-        encoding = content.get('encoding')
-        body = b''
-        if text is not None:
-            if encoding == 'base64':
-                try:
-                    body = base64.b64decode(text)
-                except Exception:
-                    body = text.encode('utf-8', 'ignore')
+CSS_URL_RE = re.compile(r'url\((?P<q>["\']?)(?P<path>[^)]+?)(?P=q)\)', re.IGNORECASE)
+def replace_css_urls(css_text: str, repl_func):
+    def _repl(m):
+        raw = m.group("path").strip()
+        # 避免處理 data: URIs
+        if raw.lower().startswith('data:'):
+            return f'url({m.group("q")}{raw}{m.group("q")})'
+        return f'url("{repl_func(raw)}")'
+    return CSS_URL_RE.sub(_repl, css_text or "")
+
+_ABS_RE = re.compile(r"^(?i:https?:)?//")
+def _is_data_uri(u: str) -> bool: return (u or "").strip().lower().startswith("data:")
+def _join_url(base_url: str, ref: str) -> str:
+    if not ref: return ref
+    if _ABS_RE.match(ref) or ref.startswith("/"): return ref
+    try:
+        bu = urlparse(base_url)
+        base_path = bu.path
+        if not base_path.endswith('/'):
+            base_dir = os.path.dirname(base_path)
+        else:
+            base_dir = base_path
+        if not base_dir.endswith('/'):
+            base_dir += '/'
+        
+        new_path = os.path.normpath(base_dir + ref)
+        return urlunparse((bu.scheme, bu.netloc, new_path, "", "", ""))
+    except Exception:
+        return ref
+        
+# ---------- HAR Index (核心類別 from v2, 整合 v1 的解壓縮邏輯) ----------
+class HarIndex:
+    def __init__(self, har_dict: dict):
+        self.har = har_dict
+        log = har_dict.get("log", {})
+        self.entries = log.get("entries", [])
+        self.pages = log.get("pages", [])
+        self.by_url = {}
+        self.html_entries = []  # (iso, entry)
+        self.res_payload = {}
+        self.res_meta = {}
+        self._build()
+
+    def _maybe_decompress(self, raw: bytes, headers: dict) -> bytes:
+        enc = (headers or {}).get('content-encoding', '').lower()
+        if not raw: return raw
+        try:
+            if 'gzip' in enc: return gzip.decompress(raw)
+            if 'deflate' in enc: return zlib.decompress(raw)
+            if 'br' in enc and _brotli: return _brotli.decompress(raw)
+        except Exception: pass
+        return raw
+
+    def _entry_bytes(self, e) -> bytes | None:
+        try:
+            res = e.get("response", {})
+            content = res.get("content", {})
+            if "text" not in content: return None
+
+            text = content.get("text") or ""
+            encoding = content.get("encoding")
+            
+            if encoding == "base64":
+                raw = base64.b64decode(text)
             else:
-                body = text.encode('utf-8', 'ignore')
+                raw = text.encode("utf-8", errors="replace")
 
-        # headers
-        headers = {}
-        for h in (res.get('headers') or []):
-            name = (h.get('name') or h.get('Name') or '').strip()
-            value = (h.get('value') or h.get('Value') or '')
-            if name:
-                headers[name.lower()] = value
+            headers = {h.get('name','').lower(): h.get('value','') for h in res.get("headers", [])}
+            return self._maybe_decompress(raw, headers)
+        except Exception:
+            return None
 
-        status = int(res.get('status') or 200)
-        ct = headers.get('content-type', '') or ''
+    def _build(self):
+        for e in self.entries:
+            req = e.get("request", {})
+            res = e.get("response", {})
+            url = req.get("url", "")
+            if not url: continue
 
-        rec = {
-            'status': status,
-            'headers': headers,
-            'body': body,
-            'url': url,
-            'method': method,
-            'path_qs': path_qs,
-            'origin': origin,
-        }
+            self.by_url.setdefault(url, []).append(e)
+            b = self._entry_bytes(e)
+            
+            if b is not None:
+                rid = sha256_bytes(b)[:16]
+                if rid not in self.res_payload:
+                    self.res_payload[rid] = b
+                    content = res.get("content", {})
+                    self.res_meta[rid] = {
+                        "url": url,
+                        "mime": content.get("mimeType") or guess_mime(url),
+                        "status": res.get("status"),
+                        "startedDateTime": e.get("startedDateTime"),
+                        "pageref": e.get("pageref"),
+                        "size": len(b),
+                        "sha256": sha256_bytes(b),
+                        "md5": md5_bytes(b),
+                    }
+            
+            mime = (res.get("content", {}).get("mimeType") or "").lower()
+            if "text/html" in mime and req.get('method', 'GET').upper() == 'GET':
+                self.html_entries.append((iso_norm(e.get("startedDateTime") or ""), e))
+        
+        self.html_entries.sort(key=lambda t: t[0], reverse=True)
 
-        maps['by_full'][(method, url)] = rec
-        maps['by_path_qs'][(method, path_qs)] = rec
-        url_list.append(url)
-
-        # 收錄 rewrite_map：只記「GET 且 body 不為空」的完整絕對 URL
-        if method == 'GET' and url and body:
-            rewrite_map.add(url)
-
-        # 蒐集 HTML 候選（用於時間清單與主頁推測）
-        if method == 'GET' and status == 200 and 'text/html' in ct.lower():
-            html_entries.append((started_dt, path_qs, url, status, ct, len(body or b''), origin))
-            # 統計來源網域（作為主網域推測）
-            if origin:
-                domain_count[origin] = domain_count.get(origin, 0) + 1
-
-    # 依時間排序（新→舊）
-    html_entries.sort(key=lambda x: (x[0] or datetime.min), reverse=True)
-
-    # 推測主網域：HTML 出現最多的 origin（如果沒有就 None）
-    main_origin = None
-    if domain_count:
-        main_origin = max(domain_count.items(), key=lambda kv: kv[1])[0]
-
-    # 主頁推測：在主網域中，選擇第一個 HTML 的 path_qs
-    main_path_qs = None
-    if main_origin:
-        for (dtv, pqs, full, st, ct, blen, origin) in html_entries:
-            if origin == main_origin:
-                main_path_qs = pqs
-                break
-    # 若仍無，退而求其次用第一筆 HTML
-    if not main_path_qs and html_entries:
-        main_path_qs = html_entries[0][1]
-
-    return {
-        'maps': maps,
-        'url_list': url_list,
-        'origins': origins,
-        'main_path_qs': main_path_qs,
-        'main_origin': main_origin,
-        'rewrite_map': rewrite_map,
-        'html_entries': html_entries,  # 給清單/compose用
-        'base_html': None,             # 之後由 GUI/CLI 填入 bytes
-        'base_html_path': None,        # 原始路徑字串
-    }
-
-# ---------- HTML 改寫 ----------
-def _replace_abs_urls_with_local(html_text, server_base, rewrite_map, allow_external):
-    """
-    allow_external=True ：外聯補資源 → 只把 HAR 有的絕對 URL 改為本機，其餘保持原樣（交由瀏覽器上網抓）
-    allow_external=False：純本機 → HAR 見過的所有 origin 一律改成本機，即便沒 body（避免外聯）
-    """
-    out = html_text
-    if allow_external:
-        # 只改我們確定有 body 的完整 URL
-        for full_url in list(rewrite_map):
-            u = urlsplit(full_url)
-            path_qs = u.path + (('?' + u.query) if u.query else '')
-            out = out.replace(full_url, f"{server_base}{path_qs}")
-
-        # 針對上述 URL 的主機，處理協定相對（//host/...）
-        seen_hosts = {urlsplit(u).netloc for u in rewrite_map}
-        for host in list(seen_hosts):
-            pattern = re.compile(r'(?P<prefix>["\'(])//' + re.escape(host) + r'(?P<path>/[^"\'\s)]+)')
-            def _sub(m):
-                return m.group('prefix') + f"{server_base}{m.group('path')}"
-            out = pattern.sub(_sub, out)
+    def list_pages(self):
+        out = []
+        if not self.pages:
+            times = [e.get("startedDateTime") for e in self.entries if e.get("startedDateTime")]
+            started = min(times) if times else None
+            out.append({"id": "page_0", "title": "Default Page", "startedDateTime": started}); return out
+        for p in self.pages:
+            out.append({"id": p.get("id"), "title": p.get("title"), "startedDateTime": p.get("startedDateTime")})
         return out
 
-    # 純本機：將 HAR 見過的所有 origin 改成 server_base
-    origins = set(urlsplit(u).scheme + "://" + urlsplit(u).netloc for u in rewrite_map)
-    for origin in origins:
-        out = out.replace(origin, server_base)
-        # 協定相對
-        host = urlsplit(origin).netloc
-        # 注意：這裡保留 //localhost:PORT 型式
-        out = out.replace(f"//{host}", f"//localhost:{urlsplit(server_base).port or ''}".rstrip(':'))
-    return out
+    def best_home_html_entry(self, page_id: str | None):
+        cands = []
+        entries = [e for e in self.entries if (page_id is None or e.get("pageref")==page_id)]
+        for e in entries:
+            res = e.get("response", {})
+            content = res.get("content", {})
+            mime = (content.get("mimeType") or "").lower()
+            if "text/html" in mime:
+                b = self._entry_bytes(e); size = len(b) if b else 0
+                ok = res.get("status") in (200, 304)
+                cands.append((ok, size, e))
+        if not cands: return None
+        cands.sort(key=lambda x:(x[0], x[1]), reverse=True)
+        return cands[0][2]
 
-def rewrite_html(body_bytes, server_scheme, server_port, ctx, allow_external=True):
-    # 試著解碼
-    html_text = None
-    for enc in ('utf-8', 'latin-1'):
-        try:
-            html_text = body_bytes.decode(enc)
-            break
-        except Exception:
-            continue
-    if html_text is None:
-        return body_bytes
+    def html_entry_by_ts(self, ts_iso: str):
+        if not self.html_entries: return None
+        # 精確匹配
+        for ts, e in self.html_entries:
+            if ts == ts_iso: return e
+        # 若無，找第一個比它早的
+        earlier = [e for ts, e in self.html_entries if ts <= ts_iso]
+        return earlier[0] if earlier else self.html_entries[-1][1]
 
-    server_base = f"{server_scheme}://localhost:{server_port}"
-    rewrite_map = ctx.get('rewrite_map', set())
-    html_text = _replace_abs_urls_with_local(html_text, server_base, rewrite_map, allow_external)
+    def payload_for_url(self, url: str):
+        lst = self.by_url.get(url) or []
+        # 從最新的請求開始找
+        for e in reversed(lst):
+            b = self._entry_bytes(e)
+            if b is not None:
+                rid = sha256_bytes(b)[:16]
+                return rid, b, self.res_meta.get(rid)
+        return None, None, None
 
-    return html_text.encode('utf-8')
+# ---------- Composer (核心類別 from v2) ----------
+class Composer:
+    def __init__(self, har: HarIndex, snapshot_html: str | None = None):
+        self.har = har
+        self.snapshot_html = snapshot_html
+        self.url_to_resid = {}
+        for url in self.har.by_url.keys():
+            rid, b, meta = self.har.payload_for_url(url)
+            if rid: self.url_to_resid[url] = rid
 
-# ---------- Threading HTTP Server（停止更快） ----------
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+    def _map(self, u: str, base_url: str, ext: str, stats):
+        if not u or _is_data_uri(u): return u
+        full = _join_url(base_url, u)
+        stats["total"] += 1
+        if full.lower().endswith('.js'): stats["js_total"] += 1
+            
+        rid = self.url_to_resid.get(full)
+        if rid:
+            stats["hits"] += 1
+            if full.lower().endswith('.js'): stats["js_hits"] += 1
+            return f"/__res?id={rid}"
+        
+        stats["missing"].append(full)
+        return full if ext=="on" else f"/__missing?url={quote(full)}"
 
-# ---------- HTTP Handler ----------
-class HarHandler(BaseHTTPRequestHandler):
-    ctx = None
-    server_port = None
+    def _rewrite_html(self, html_text: str, base_url: str, ext: str):
+        stats = {"total":0, "hits":0, "missing":[], "js_total": 0, "js_hits": 0}
+        if not _HAS_BS4:
+            # Fallback regex mode
+            out = re.sub(r'(?P<attr>\b(?:src|href)=)(["\'])(?P<u>[^"\']+)\2',
+                         lambda m: f'{m.group("attr")}"{self._map(m.group("u"), base_url, ext, stats)}"',
+                         html_text, flags=re.IGNORECASE)
+            out = replace_css_urls(out, lambda p: self._map(p.strip(), base_url, ext, stats))
+            return out, stats
+        
+        # Preferred BeautifulSoup mode
+        soup = BeautifulSoup(html_text, "html.parser")
+        for tag, attr in [("img","src"),("script","src"),("link","href"),("iframe","src"), ("source", "src"), ("video", "poster")]:
+            for el in soup.find_all(tag):
+                u = el.get(attr)
+                if u: el[attr] = self._map(u, base_url, ext, stats)
+        for el in soup.find_all("style"):
+            if el.string and "url(" in el.string:
+                el.string = replace_css_urls(el.string, lambda p:self._map(p, base_url, ext, stats))
+        for el in soup.find_all(True, style=True):
+            st = el.get("style")
+            if st and "url(" in st:
+                el["style"] = replace_css_urls(st, lambda p:self._map(p, base_url, ext, stats))
+        return str(soup), stats
 
-    def do_GET(self): self._serve()
-    def do_POST(self): self._serve()
-    def log_message(self, fmt, *args): pass
+    def _is_spa_shell(self, html_text: str) -> bool:
+        bt = html_text.lower()
+        m = re.search(r"<body[^>]*>(.*)</body>", bt, flags=re.DOTALL)
+        if not m: return False
+        inner = m.group(1)
+        textish = re.sub(r"<[^>]+>", "", inner).strip()
+        scripts = len(re.findall(r"<script\b", inner, flags=re.IGNORECASE))
+        return (len(textish)<50) and (scripts>=1)
 
-    def _send_bytes(self, body: bytes, ctype="text/html; charset=utf-8", status=200):
-        self.send_response(status)
-        if ctype:
-            self.send_header("content-type", ctype)
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
+    def _err_page(self) -> bytes:
+        html_err = """<!doctype html><html><head><meta charset="utf-8">
+<title>回放錯誤</title><style>body{font-family:ui-sans-serif,system-ui;max-width:780px;margin:28px auto;padding:0 16px;color:#222}.callout{background:#fff4cd;border:1px solid #ffe39a;border-radius:8px;padding:14px 16px}</style></head>
+<body><h1>無法回放本頁</h1>
+<div class="callout"><p><strong>原因：</strong>主頁 HTML 缺失或為 SPA 空殼頁。</p>
+<ul><li>請提供 DOM Snapshot（基底快照）。</li>
+<li>或用「外聯補資源模式」。</li>
+<li>或重新蒐集 HAR（停用快取 + Save all as HAR with content）。</li></ul>
+</div></body></html>"""
+        return html_err.encode("utf-8")
 
-    def _compose_html(self, html_rec, scheme, allow_external):
-        """
-        組合畫面：
-        - 若設定了 base_html（DOM 快照），以它為主體；否則以 html_rec 的 body 為主體
-        - 再按 allow_external 模式改寫 URL
-        """
-        body = None
-        if self.ctx.get('base_html'):
-            body = self.ctx['base_html']
-        elif html_rec:
-            body = html_rec.get('body') or b""
+    def _banner(self, html_text: str, msg: str) -> str:
+        inj = f"""<div style="position:fixed;left:0;right:0;top:0;background:#fff4cd;border-bottom:1px solid #ffe39a;color:#7a5a00;padding:8px 12px;z-index:99999;font-family:ui-sans-serif,system-ui"><strong>提示</strong>：{html.escape(msg)}</div>"""
+        return re.sub("</body>", inj+"</body>", html_text, flags=re.IGNORECASE) if "</body>" in html_text.lower() else inj+html_text
+
+    def _compose(self, base_html, base_url, ext="off"):
+        if not (base_html and base_html.strip()): return self._err_page(), {"total":0,"hits":0,"missing":[]}
+        out, stats = self._rewrite_html(base_html, base_url, ext)
+        if (not self.snapshot_html) and self._is_spa_shell(base_html):
+            out = self._banner(out, "偵測到此頁面可能為 SPA 空殼頁，建議提供 DOM Snapshot（基底快照）以獲取最佳還原效果。")
+        return out.encode("utf-8"), stats
+        
+    def compose_final(self, page_id: str|None, ext="off"):
+        base_html, base_url = None, ""
+        best_entry = self.har.best_home_html_entry(page_id)
+        
+        if self.snapshot_html:
+            base_html = self.snapshot_html
+            base_url = best_entry.get("request",{}).get("url","") if best_entry else ""
+        elif best_entry:
+            rid, b, _ = self.har.payload_for_url(best_entry.get("request",{}).get("url",""))
+            base_html = ensure_text(b or b"")
+            base_url = best_entry.get("request",{}).get("url","")
+            
+        return self._compose(base_html, base_url, ext)
+
+    def compose_by_ts(self, ts_iso: str, ext="off"):
+        base_html, base_url = None, ""
+        entry = self.har.html_entry_by_ts(ts_iso)
+
+        if self.snapshot_html:
+            base_html = self.snapshot_html
+            base_url = entry.get("request",{}).get("url","") if entry else ""
+        elif entry:
+            rid, b, _ = self.har.payload_for_url(entry.get("request",{}).get("url",""))
+            base_html = ensure_text(b or b"")
+            base_url = entry.get("request",{}).get("url","")
+            
+        return self._compose(base_html, base_url, ext)
+
+
+# ---------- Exporter (核心類別 from v2) ----------
+class Exporter:
+    def __init__(self, har: HarIndex, composer: Composer, out_dir: str):
+        self.har = har; self.composer = composer; self.out_dir = out_dir
+
+    def run(self, mode: str, ts_iso: str|None=None, page_id: str|None=None):
+        os.makedirs(self.out_dir, exist_ok=True)
+        res_dir = os.path.join(self.out_dir, "resources"); os.makedirs(res_dir, exist_ok=True)
+        for rid,b in self.har.res_payload.items():
+            with open(os.path.join(res_dir, rid), "wb") as f: f.write(b)
+        
+        if ts_iso:
+            html_bytes, stats = self.composer.compose_by_ts(ts_iso, ext=mode)
         else:
-            page = "<!doctype html><meta charset='utf-8'><title>No HTML</title><h2>沒有可用的 HTML</h2>"
-            return page.encode("utf-8")
+            html_bytes, stats = self.composer.compose_final(page_id, ext=mode)
+        
+        snap_path = os.path.join(self.out_dir, "page_snapshot.html")
+        with open(snap_path, "wb") as f: f.write(html_bytes)
+        
+        manifest = {
+            "generated_at": dt.datetime.utcnow().isoformat()+"Z",
+            "replay_version": __version__,
+            "mode": "online-augment" if mode=="on" else "offline",
+            "ts_iso_utc": ts_iso, "page_id": page_id,
+            "final_snapshot": {"path":"page_snapshot.html","sha256":sha256_bytes(html_bytes),"md5":md5_bytes(html_bytes)},
+            "resources": list(self.har.res_meta.values()),
+            "missing_resources": stats.get("missing", []),
+        }
+        with open(os.path.join(self.out_dir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        
+        with open(os.path.join(self.out_dir, "hashes_sha256.txt"), "w", encoding="utf-8") as f:
+            f.write(f"{manifest['final_snapshot']['sha256']}  page_snapshot.html\n")
+            for rid in self.har.res_payload.keys():
+                meta = self.har.res_meta.get(rid, {})
+                f.write(f"{meta.get('sha256')}  resources/{rid}\n")
+        
+        report = self._report_html(manifest)
+        with open(os.path.join(self.out_dir, "report.html"), "w", encoding="utf-8") as f: f.write(report)
+        
+        with open(os.path.join(self.out_dir, "NOTE.txt"), "w", encoding="utf-8") as f:
+            f.write("此為自動化產生的證據包。\n若需手動截圖或錄影，請開啟 page_snapshot.html 進行操作。\n")
+        
+        return self.out_dir
 
-        return rewrite_html(body, scheme, self.server_port, self.ctx, allow_external=allow_external)
-
-    def _serve(self):
-        ctx = self.ctx
-        maps = ctx['maps']
-        html_entries = ctx.get('html_entries', [])
-        main_path_qs = ctx.get('main_path_qs')
-        main_origin = ctx.get('main_origin')
-
-        method = self.command.upper()
-        path_qs = self.path
-
-        # === 清單頁（預設） ===
-        if path_qs == "/" or path_qs.startswith("/__list"):
-            main_pqs = main_path_qs or "(未定)"
-            page = self._render_list_page(main_pqs, html_entries, ctx.get('base_html_path'))
-            self._send_bytes(page.encode("utf-8"))
-            return
-
-        # === 偵錯頁 ===
-        if path_qs.startswith("/__debug"):
-            stats = {
-                "version": __version__,
-                "main_origin": main_origin,
-                "main_path_qs": main_path_qs,
-                "html_entries_count": len(html_entries),
-                "port": self.server_port,
-                "base_html_path": ctx.get('base_html_path'),
-            }
-            pretty = json.dumps(stats, ensure_ascii=False, indent=2)
-            page = f"<!doctype html><meta charset='utf-8'><title>Debug</title><pre>{html.escape(pretty)}</pre><p><a href='/'>返回清單</a></p>"
-            self._send_bytes(page.encode("utf-8"))
-            return
-
-        # === 合成頁：最終或指定時間 ===
-        if path_qs.startswith("/__compose"):
-            # 參數：view=[final|time] ; ts=ISO ; ext=on/off
-            qs = ""
-            if "?" in path_qs:
-                qs = path_qs.split("?", 1)[1]
-            params = parse_qs(qs or "")
-            view = (params.get("view") or ["final"])[0]
-            ext  = (params.get("ext") or ["on"])[0]
-            allow_external = (ext.lower() == "on")
-
-            is_tls = isinstance(self.server.socket, ssl.SSLSocket)
-            scheme = 'https' if is_tls else 'http'
-
-            target_rec = None
-            if view == "final":
-                if main_path_qs:
-                    target_rec = maps['by_path_qs'].get(('GET', main_path_qs))
-                if not target_rec and html_entries:
-                    latest_pqs = html_entries[0][1]
-                    target_rec = maps['by_path_qs'].get(('GET', latest_pqs))
-            else:
-                # 指定時間點：找離該 ts 最近、且時間 <= ts 的 HTML
-                ts_str = (params.get("ts") or [""])[0]
-                cutoff = None
-                try:
-                    cutoff = datetime.fromisoformat(ts_str)
-                except Exception:
-                    cutoff = None
-                chosen = None
-                if cutoff and html_entries:
-                    for (dtv, pqs, full, st, ct, blen, origin) in html_entries:
-                        if dtv and dtv <= cutoff:
-                            chosen = (dtv, pqs)
-                            break
-                if chosen:
-                    target_rec = maps['by_path_qs'].get(('GET', chosen[1]))
-                elif html_entries:
-                    target_rec = maps['by_path_qs'].get(('GET', html_entries[-1][1]))
-
-            body = self._compose_html(target_rec, scheme, allow_external)
-            # 包裝最簡容器頁
-            inner = body.decode('utf-8', errors='ignore')
-            tips_banner = ""
-            if ctx.get('base_html_path'):
-                tips_banner = f"""<div style="position:sticky;top:0;background:#fff3cd;color:#664d03;border:1px solid #ffecb5;border-radius:6px;padding:8px 10px;margin:6px 0;">
-                已套用基底快照：<code>{html.escape(ctx.get('base_html_path') or '')}</code>
-                </div>"""
-            html_shell = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>HAR Compose</title></head><body>
-{tips_banner}
-{inner}
-</body></html>"""
-            self._send_bytes(html_shell.encode("utf-8"))
-            return
-
-        # === 其他資源（靜態回放） ===
-        rec = maps['by_path_qs'].get((method, path_qs))
-        if not rec:
-            # 再嘗試用完整 URL（以目前 Host + scheme）
-            is_tls = isinstance(self.server.socket, ssl.SSLSocket)
-            scheme = 'https' if is_tls else 'http'
-            host = self.headers.get('Host', '').strip()
-            if host:
-                full_url = f"{scheme}://{host}{path_qs}"
-                rec = maps['by_full'].get((method, full_url))
-
-        if not rec:
-            msg = f"Not found in HAR: {method} {path_qs}\n"
-            self._send_bytes(msg.encode("utf-8"), ctype="text/plain; charset=utf-8", status=404)
-            return
-
-        status = rec['status']
-        headers = rec['headers']
-        body = rec['body'] or b""
-        ct = headers.get('content-type', '')
-
-        self.send_response(status)
-        if ct: self.send_header('content-type', ct)
-        self.send_header('content-length', str(len(body)))
-        self.send_header('cache-control', 'no-cache')
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
-
-    # ---- 清單頁渲染（表格） ----
-    def _render_list_page(self, main_pqs, html_entries, base_html_path):
-        main_pqs_disp = html.escape(main_pqs or "(未定)")
-
-        def fmt_dt(dt):
-            try: return dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception: return "(no time)"
-
+    def _report_html(self, m: dict) -> str:
         rows = []
-        for (dtv, pqs, full, st, ct, blen, origin) in html_entries:
-            ts = dtv.isoformat() if dtv else ""
-            dt_disp  = html.escape(fmt_dt(dtv))
-            pqs_disp = html.escape(pqs or "")
-            rows.append(
-                f"""<tr>
-                      <td class="col-time"><code>{dt_disp}</code></td>
-                      <td class="col-url"><code>{pqs_disp}</code></td>
-                      <td class="col-actions">
-                        <a class="btn small primary" target="_blank" rel="noopener" href="/__compose?view=time&ts={ts}&ext=on">預覽（外聯補資源）</a>
-                        <a class="btn small"          target="_blank" rel="noopener" href="/__compose?view=time&ts={ts}&ext=off">預覽（純本機）</a>
-                      </td>
-                    </tr>"""
-            )
-        rows_html = ("\n".join(rows)) if rows else \
-                    "<tr><td colspan='3' class='empty'>（此 HAR 找不到 HTML）</td></tr>"
+        for meta in sorted(m['resources'], key=lambda x: x.get('startedDateTime', '')):
+            rows.append("<tr>"
+                        f"<td>{html.escape(meta.get('mime') or '')}</td>"
+                        f"<td style='word-break:break-all'><code>{html.escape(meta.get('url') or '')}</code></td>"
+                        f"<td>{meta.get('status')}</td>"
+                        f"<td>{meta.get('size')}</td>"
+                        f"<td><code>{html.escape(meta.get('sha256',''))}</code></td>"
+                        "</tr>")
+        miss = "".join(f"<li><code>{html.escape(u)}</code></li>" for u in m.get("missing_resources", []))
+        return f"""<!doctype html><html><head><meta charset="utf-8"><title>Evidence Report</title>
+<style>body{{font-family:ui-sans-serif,system-ui;max-width:1060px;margin:28px auto;padding:0 16px;color:#222}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;border-bottom:1px solid #eee;padding:8px}}code{{background:#eef2f6;padding:2px 4px;border-radius:4px}}</style></head>
+<body><h1>Evidence Report</h1>
+<p><strong>Generated at (UTC)</strong> {html.escape(m['generated_at'])} ｜ <strong>Mode</strong> {html.escape(m['mode'])}</p>
+<p><strong>Timestamp (UTC)</strong> {html.escape(m.get('ts_iso_utc') or 'Latest (Final Composition)')}</p>
+<h2>Missing Resources ({len(m.get('missing_resources',[]))})</h2><ul>{miss or "<li>None</li>"}</ul>
+<h2>Archived Resources ({len(m.get('resources',[]))})</h2><table><thead><tr><th>MIME</th><th>Original URL</th><th>Status</th><th>Size (Bytes)</th><th>SHA256</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+</body></html>"""
 
-        base_hint = ""
-        if base_html_path:
-            base_hint = f"<p style='margin:8px 0 0;color:#0a7;'>已載入基底快照：<code>{html.escape(base_html_path)}</code></p>"
-
-        page = f"""<!doctype html>
-<html><head><meta charset="utf-8">
-<title>HAR Replay / List</title>
+# ---------- Web UI (整合 v1 & v2) ----------
+LIST_TMPL = """<!doctype html><html><head><meta charset="utf-8">
+<title>HAR 回放清單</title>
 <style>
- body {{ font-family: -apple-system, BlinkMacSystemFont, "Noto Sans CJK TC", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:#222; }}
- .wrap {{ max-width: 1000px; margin: 28px auto; padding: 0 16px; }}
- h1 {{ margin: 0 0 10px; }}
- .subtle {{ color:#666; margin: 0 0 18px; }}
- .callout {{ background:#f6f8fa; border:1px solid #eaecef; padding:14px 16px; border-radius:8px; margin:18px 0; }}
- .btn {{ display:inline-block; padding:8px 14px; border-radius:6px; text-decoration:none; border:1px solid #d0d7de; background:#fff; color:#0969da; }}
- .btn.primary {{ background:#0969da; color:#fff; border-color:#0969da; }}
- .btn.small {{ padding:6px 10px; font-size: 12px; }}
- .footer {{ color:#555; margin-top: 18px; text-align:right; }}
-
- table {{ width:100%; border-collapse:collapse; table-layout: fixed; }}
- thead th {{ text-align:left; font-weight:600; color:#444; border-bottom:1px solid #eaecef; padding:8px 10px; }}
- tbody td {{ vertical-align:top; border-bottom:1px solid #f0f2f4; padding:10px; }}
- code {{ background:#eef2f6; padding:2px 6px; border-radius:4px; }}
-
- .col-time {{ width: 160px; white-space:nowrap; }}
- .col-url  {{ width: 600px; overflow-wrap:anywhere; word-break:break-all; }}
- .col-actions {{ width: 200px; }}
- .col-actions a {{ display:block; margin-bottom:6px; text-align:center; }}
- .col-actions a:last-child {{ margin-bottom:0; }}
- .empty {{ color:#666; text-align:center; padding:18px 0; }}
-</style>
-</head>
+ body { font-family: -apple-system, BlinkMacSystemFont, "Noto Sans CJK TC", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:#222; }
+ .wrap { max-width: 1080px; margin: 28px auto; padding: 0 16px; }
+ .subtle { color:#666; margin: 0 0 18px; }
+ .callout { background:#f6f8fa; border:1px solid #eaecef; padding:14px 16px; border-radius:8px; margin:18px 0; }
+ .btn { display:inline-block; padding:8px 14px; border-radius:6px; text-decoration:none; border:1px solid #d0d7de; background:#fff; color:#0969da; }
+ .btn.primary { background:#0969da; color:#fff; border-color:#0969da; }
+ .btn.small { padding:6px 10px; font-size: 12px; }
+ table { width:100%; border-collapse:collapse; table-layout: fixed; }
+ thead th { text-align:left; font-weight:600; color:#444; border-bottom:1px solid #eaecef; padding:8px 10px; }
+ tbody td { vertical-align:top; border-bottom:1px solid #f0f2f4; padding:10px; }
+ code { background:#eef2f6; padding:2px 6px; border-radius:4px; }
+ .col-time { width: 170px; white-space:nowrap; }
+ .col-url  { width: 520px; overflow-wrap:anywhere; word-break:break-all; }
+ .col-score { width: 110px; }
+ .col-actions { width: 240px; }
+ .badge { display:inline-block; min-width:48px; text-align:center; padding:2px 8px; border-radius:12px; font-size:12px; }
+ .badge.ok { background:#daf5d8; color:#1b5e20; border:1px solid #b7e4b3; }
+ .badge.warn { background:#fff4cd; color:#7a5a00; border:1px solid #ffe39a; }
+ .badge.bad { background:#ffe2e0; color:#7f1d1d; border:1px solid #ffb3ad; }
+ .dupe { color:#7a5a00; font-size:12px; }
+ .footer { color:#555; margin-top: 18px; text-align:right; }
+</style></head>
 <body><div class="wrap">
   <h1>HAR 回放清單</h1>
-  <p class="subtle">當前程式版本：{__version__}</p>
-
+  <p class="subtle">版本 __VER__ ｜ 時區 <strong>台灣（UTC+8）</strong></p>
   <div class="callout">
-    <p style="margin:0 0 6px;">
-      <strong>建議：</strong>先按「最終合成」，我們會以主要網站的主頁為基礎，把同網域中最後可用的資源補上。<br>
-      目前偵測的主頁：<code>{main_pqs_disp}</code>
-    </p>
+    <p style="margin:0 0 6px;"><strong>最終合成 (Final Composition):</strong> 以「__HOME__」為主頁，整合 HAR 中所有資源，呈現最完整的最終狀態。</p>
+    __BASE_HINT__
     <p style="margin:6px 0 0;">
       <a class="btn primary" target="_blank" rel="noopener" href="/__compose?view=final&ext=on">最終合成（外聯補資源）</a>
       <a class="btn" target="_blank" rel="noopener" href="/__compose?view=final&ext=off">最終合成（純本機）</a>
       <a class="btn" target="_blank" rel="noopener" href="/__debug">偵錯資訊</a>
     </p>
-    {base_hint}
   </div>
-
-  <h3>依時間預覽（新 → 舊）</h3>
-  <table>
-    <thead>
-      <tr><th class="col-time">時間</th><th class="col-url">路徑（path+query）</th><th class="col-actions">預覽</th></tr>
-    </thead>
-    <tbody>
-      {rows_html}
-    </tbody>
-  </table>
-
-  <h3>說明</h3>
-  <div class="callout">
-    <ul>
-      <li><strong>外聯補資源</strong>：我們有存到的檔改寫成本機；沒存到的保留原網址 → 瀏覽器會上網補齊，外觀更接近當時。</li>
-      <li><strong>純本機</strong>：HAR 見過的網域一律指回本機，不會對外連線（缺的資源會顯示不出）。</li>
-      <li><strong>基底快照</strong>：若提供了 DOM 快照（Base HTML），會以它為頁面主體，再套上述兩種模式補資源。</li>
-      <li>合成屬「靜態回填」：不執行 JavaScript；互動/廣告/外掛不一定能完全重播。</li>
-    </ul>
-  </div>
+  <h3>依時間點預覽 (新 → 舊)</h3>
+  <table><thead><tr>
+    <th class="col-time">時間 (UTC+8)</th>
+    <th class="col-url">路徑 (path+query)</th>
+    <th class="col-score">離線可見度</th>
+    <th class="col-score">JS 命中率</th>
+    <th class="col-actions">預覽</th>
+  </tr></thead><tbody>__ROWS__</tbody></table>
 
   <p class="footer">臺中市政府警察局刑事警察大隊科技犯罪偵查隊</p>
-</div></body></html>"""
-        return page
+</div></body></html>
+"""
 
-# ---------- 啟動伺服器（GUI/CLI 共用） ----------
-def run_server(har_path, port=3000, cert=None, key=None, on_ready=None, on_error=None, base_html_path=None):
+class AppState:
+    def __init__(self, har_path: str, snapshot_path: str|None):
+        with open(har_path, "rb") as f: har_dict = json.load(f)
+        self.har = HarIndex(har_dict)
+        self.snapshot_html = None
+        self.snapshot_path = snapshot_path
+        if snapshot_path and os.path.exists(snapshot_path):
+            self.snapshot_html = Path(snapshot_path).read_text(encoding="utf-8", errors="ignore")
+        self.composer = Composer(self.har, self.snapshot_html)
+
+    def list_rows(self):
+        rows = []
+        seen_paths = set()
+        for ts_iso, e in self.har.html_entries:
+            url = e.get("request",{}).get("url","")
+            u = urlparse(url); path = u.path + (("?"+u.query) if u.query else "")
+            local_time = utc_to_taipei(ts_iso)
+            
+            # 使用 composer 來評分，確保邏輯一致
+            _, stats = self.composer.compose_by_ts(ts_iso, ext="off")
+            
+            total, hits = stats.get("total",0), stats.get("hits",0)
+            js_total, js_hits = stats.get("js_total", 0), stats.get("js_hits", 0)
+            
+            vis_ratio = round(hits * 100 / max(1, total)) if total > 0 else 100
+            js_ratio = round(js_hits * 100 / max(1, js_total)) if js_total > 0 else 100
+            
+            vis_badge = "ok" if vis_ratio >= 80 else ("warn" if vis_ratio >= 50 else "bad")
+            js_badge = "ok" if js_ratio >= 80 else ("warn" if js_ratio >= 50 else "bad")
+            
+            dupe_html = " <span class='dupe'>(重複路徑)</span>" if path in seen_paths else ""
+            seen_paths.add(path)
+            
+            rows.append(f"""<tr><td><code>{html.escape(local_time)}</code></td>
+                        <td><code title='{html.escape(path)}'>{html.escape(path[:80])}{'...' if len(path)>80 else ''}</code>{dupe_html}</td>
+                        <td title="資源總數: {total}, 命中: {hits}"><span class='badge {vis_badge}'>{vis_ratio}%</span></td>
+                        <td title="JS總數: {js_total}, 命中: {js_hits}"><span class='badge {js_badge}'>{js_ratio}%</span></td>
+                        <td><a class='btn small primary' target='_blank' rel='noopener' href='/__compose?view=time&ts={quote(ts_iso)}&ext=on'>外聯補資源</a>
+                            <a class='btn small' target='_blank' rel='noopener' href='/__compose?view=time&ts={quote(ts_iso)}&ext=off'>純本機</a></td></tr>""")
+        
+        if not rows:
+            rows.append("<tr><td colspan='5' style='color:#666;text-align:center;padding:18px 0'>此 HAR 未發現 text/html 回應，強烈建議提供 DOM Snapshot (基底快照)。</td></tr>")
+        
+        home_entry = self.har.best_home_html_entry(None)
+        home_path = urlparse(home_entry.get('request',{}).get('url','') if home_entry else "").path or "(未檢出)"
+        return "\n".join(rows), home_path
+
+# ---------- HTTP Server (Handler from v2) ----------
+class Handler(BaseHTTPRequestHandler):
+    state: AppState = None  # type: ignore
+    
+    def log_message(self, fmt, *args): pass
+    
+    def _w(self, code:int, body:bytes, ctype="text/html; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        # 移除有害標頭 (from v1)
+        self.send_header("Content-Security-Policy", "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        p = urlparse(self.path)
+        qs = parse_qs(p.query)
+
+        if p.path in ("/","/__list"):
+            rows, home = self.state.list_rows()
+            base_hint_html = ""
+            if self.state.snapshot_path:
+                base_hint_html = f"<p style='margin:8px 0 0;color:#0a7;'>已套用基底快照：<code>{html.escape(self.state.snapshot_path)}</code></p>"
+
+            page_html = LIST_TMPL.replace("__ROWS__", rows).replace("__HOME__", html.escape(home)) \
+                                 .replace("__VER__", __version__).replace("__BASE_HINT__", base_hint_html)
+            self._w(200, page_html.encode("utf-8")); return
+
+        if p.path=="/__debug":
+            info = {
+                "version": __version__,
+                "har_pages": len(self.state.har.pages),
+                "har_entries": len(self.state.har.entries),
+                "archived_resources": len(self.state.har.res_payload),
+                "snapshot_path": self.state.snapshot_path,
+                "bs4_enabled": _HAS_BS4
+            }
+            body = f"<!doctype html><html><head><title>Debug</title></head><body><pre>{html.escape(json.dumps(info, indent=2))}</pre></body></html>"
+            self._w(200, body.encode("utf-8")); return
+
+        if p.path=="/__compose":
+            view = (qs.get("view",["final"])[0]).lower()
+            ext=(qs.get("ext",["off"])[0]).lower()
+            if view=="final":
+                body, _ = self.state.composer.compose_final(page_id=None, ext=ext)
+            else:
+                ts = iso_norm(qs.get("ts",[""])[0])
+                body, _ = self.state.composer.compose_by_ts(ts, ext=ext)
+            self._w(200, body); return
+
+        if p.path=="/__res":
+            rid = qs.get("id",[""])[0]
+            b = self.state.har.res_payload.get(rid)
+            meta = self.state.har.res_meta.get(rid,{})
+            if b is None: self._w(404, b"Not Found", "text/plain; charset=utf-8"); return
+            ctype = meta.get("mime") or guess_mime(meta.get("url", ""))
+            self._w(200, b, ctype); return
+
+        if p.path=="/__missing":
+            u = html.escape(unquote(qs.get("url",[""])[0]))
+            body = f"""<!doctype html><html><head><meta charset='utf-8'><title>缺失資源</title>
+<style>body{{font-family:ui-sans-serif,system-ui;max-width:720px;margin:28px auto;padding:0 16px;color:#222}}.callout{{background:#ffe2e0;border:1px solid #ffb3ad;border-radius:8px;padding:14px 16px}}</style></head>
+<body><h1>資源缺失 (離線模式)</h1><div class='callout'><p>此資源未包含於 HAR：</p><p><code style='word-break:break-all'>{u}</code></p><p>可切換「外聯補資源模式」或重新蒐集完整 HAR。</p></div></body></html>"""
+            self._w(200, body.encode("utf-8")); return
+        
+        self._w(404, b"Not Found", "text/plain; charset=utf-8")
+
+# ---------- Server Runner ----------
+def run_server(har_path: str, snapshot_path: str|None, port=8000, on_ready=None, on_error=None):
     try:
-        ctx = load_har(har_path)
-    except Exception as e:
-        if on_error: on_error(f"讀取 HAR 失敗：{e}")
-        else: print(f"[HAR Replay] 讀取 HAR 失敗：{e}")
-        return None
-
-    # 載入 Base HTML（若有）
-    if base_html_path and os.path.isfile(base_html_path):
-        try:
-            with open(base_html_path, "rb") as f:
-                ctx["base_html"] = f.read()
-            ctx["base_html_path"] = base_html_path
-        except Exception:
-            ctx["base_html"] = None
-            ctx["base_html_path"] = None
-
-    httpd = ThreadingHTTPServer(("0.0.0.0", int(port)), HarHandler)
-    httpd.timeout = 0.5
-    try:
-        httpd.socket.settimeout(1.0)
-    except Exception:
-        pass
-
-    HarHandler.ctx = ctx
-    HarHandler.server_port = int(port)
-
-    scheme = "http"
-    if cert and key:
-        try:
-            sc = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            sc.load_cert_chain(cert, key)
-            httpd.socket = sc.wrap_socket(httpd.socket, server_side=True)
-            scheme = "https"
-        except Exception as e:
-            if on_error: on_error(f"載入憑證失敗：{e}")
-            else: print(f"[HAR Replay] 載入憑證失敗：{e}")
-            return None
-
-    def _serve():
-        if on_ready: on_ready(scheme)
-        try:
+        app_state = AppState(har_path, snapshot_path)
+        Handler.state = app_state
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        
+        def _serve():
+            if on_ready: on_ready(f"http://127.0.0.1:{port}")
             httpd.serve_forever()
-        except Exception as e:
-            if on_error: on_error(f"伺服器例外：{e}")
 
-    t = threading.Thread(target=_serve, daemon=True)
-    t.start()
-    return httpd, t, scheme
+        th = threading.Thread(target=_serve, daemon=True)
+        th.start()
+        return httpd, th
+    except Exception as e:
+        if on_error: on_error(str(e))
+        else: print(f"[錯誤] 伺服器啟動失敗: {e}")
+        return None, None
 
-# ---------- GUI ----------
-def start_gui():
+# ---------- Desktop GUI (整合 v1 & v2) ----------
+def start_gui(args):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
-    from tkinter import PhotoImage
+    try:
+        from tkinter import PhotoImage
+    except ImportError:
+        PhotoImage = None # type: ignore
 
     DOM_SNIPPET = 'copy(document.documentElement.outerHTML);'
 
     class App(tk.Tk):
-        def __init__(self):
+        def __init__(self, args):
             super().__init__()
-            self.title(f"HAR Replay  v{__version__}  —  by {__author__}")
-            self.geometry("760x640")
+            self.title(f"HAR Replay Pro {__version__}  —  {UNIT_STR} —  by {__author__}")
+            self.geometry("780x680")
             self.resizable(False, False)
+            
+            self.srv = {"httpd": None, "th": None, "port": args.port}
 
-            # 視窗 icon（優先 .ico，沒有就用 .png）
+            # --- Icon and Banner (from v1) ---
             for cand in APP_ICON_CANDIDATES:
                 p = resource_path(cand)
                 if os.path.isfile(p):
@@ -546,13 +643,8 @@ def start_gui():
                     except Exception:
                         pass
 
-            self.httpd = None
-            self.srv_thread = None
-            self.scheme = "http"
-
-            # ===== 上方：簡單說明 + 橫幅圖 =====
             top = ttk.Frame(self); top.pack(fill="x", padx=12, pady=(10,4))
-
+            
             banner_path = resource_path(BANNER_FILE)
             self._banner_img = None
             if os.path.isfile(banner_path):
@@ -561,287 +653,211 @@ def start_gui():
                     ttk.Label(top, image=self._banner_img).pack(anchor="c", pady=(6,10))
                 except Exception:
                     pass
-
-            intro = (
-                "這是一個簡單的 HAR 回放工具：\n"
-                "1) 選擇 .har 檔 → 2)（可選）提供「基底快照」→ 3) 按「啟動」→ 會自動打開回放清單，\n"
-                "   再點「最終合成」或任一時間的預覽，即可看到重播畫面。\n"
-                "※ HAR 僅記請求/回應，不含 DOM/JS；合成為靜態回填（最佳努力）。"
-            )
-            ttk.Label(top, text=intro, foreground="#333").pack(anchor="w")
-
-            # ===== 檔案/埠號 =====
-            frm1 = ttk.Frame(self); frm1.pack(fill="x", padx=12, pady=(10,6))
-            ttk.Label(frm1, text="HAR 檔案：").grid(row=0, column=0, sticky="w")
-            self.har_var = tk.StringVar()
+                
+            intro = ("HAR 回放與證據產製工具\n"
+                     "1) 選擇 .har 檔 → 2) (強烈建議) 提供「基底快照」→ 3) 啟動伺服器\n"
+                     "   點「最終合成」或時間點預覽，即可重現網頁畫面。")
+            ttk.Label(top, text=intro, justify='left').pack(anchor="w")
+            
+            # --- 檔案/埠號 (Layout from v1) ---
+            frm1 = ttk.LabelFrame(self, text="輸入檔案"); frm1.pack(fill="x", padx=12, pady=6)
+            
+            self.har_var = tk.StringVar(value=args.har or "")
+            self.snap_var = tk.StringVar(value=args.snapshot or "")
+            
+            ttk.Label(frm1, text="HAR 檔案:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
             ttk.Entry(frm1, textvariable=self.har_var).grid(row=0, column=1, sticky="ew", padx=6)
-            ttk.Button(frm1, text="選擇…", command=self.choose_har).grid(row=0, column=2, sticky="w")
-
-            ttk.Label(frm1, text="Port：").grid(row=1, column=0, sticky="w", pady=(6,0))
-            self.port_var = tk.StringVar(value="3000")
-            ttk.Entry(frm1, width=10, textvariable=self.port_var).grid(row=1, column=1, sticky="w", padx=6, pady=(6,0))
+            ttk.Button(frm1, text="選擇…", command=self.choose_har).grid(row=0, column=2, sticky="w", padx=6)
+            
+            ttk.Label(frm1, text="基底快照 (DOM):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+            ttk.Entry(frm1, textvariable=self.snap_var).grid(row=1, column=1, sticky="ew", padx=6)
+            ttk.Button(frm1, text="選擇…", command=self.choose_snap).grid(row=1, column=2, sticky="w", padx=6)
             frm1.grid_columnconfigure(1, weight=1)
 
-            # ===== 基底快照（Base HTML） =====
-            base = ttk.Frame(self); base.pack(fill="x", padx=12, pady=(6,0))
-            ttk.Label(base, text="基底快照（Base HTML）：").grid(row=0, column=0, sticky="w")
-            self.base_var = tk.StringVar()
-            ttk.Entry(base, textvariable=self.base_var).grid(row=0, column=1, sticky="ew", padx=6)
-            ttk.Button(base, text="選擇…", command=self.choose_base_html).grid(row=0, column=2, sticky="w")
-            base.grid_columnconfigure(1, weight=1)
+            # --- 取證工具 (from v1) ---
+            tools = ttk.LabelFrame(self, text="現場取證工具"); tools.pack(fill="x", padx=12, pady=6)
+            ttk.Button(tools, text="取證教學", command=self.open_forensic_tips).pack(side="left", padx=6, pady=4)
+            ttk.Button(tools, text="複製 DOM 指令", command=lambda: self.copy_to_clipboard(DOM_SNIPPET)).pack(side="left", padx=6)
+            ttk.Button(tools, text="從剪貼簿存成 HTML…", command=self.save_clipboard_to_html).pack(side="left", padx=6)
 
-            base2 = ttk.Frame(self); base2.pack(fill="x", padx=12, pady=(2,0))
-            ttk.Button(base2, text="取證教學", command=self.open_forensic_tips).pack(side="left")
-            ttk.Button(base2, text="複製 DOM 指令", command=lambda: self.copy_to_clipboard(DOM_SNIPPET)).pack(side="left", padx=(6,0))
-            ttk.Button(base2, text="從剪貼簿存成 HTML…", command=self.save_clipboard_to_html).pack(side="left", padx=(6,0))
-            ttk.Label(base2, text="（把 DOM 指令貼到瀏覽器 Console 執行後，貼上內容到剪貼簿）", foreground="#666").pack(side="left", padx=8)
-
-            # ===== 進階（憑證）— 預設隱藏 =====
-            adv_hdr = ttk.Frame(self); adv_hdr.pack(fill="x", padx=12, pady=(10,0))
-            self.show_adv = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                adv_hdr, text="顯示進階設定（HTTPS 憑證）",
-                variable=self.show_adv, command=self.toggle_adv
-            ).pack(anchor="w")
-
-            meta = ttk.Frame(self); meta.pack(fill="x", padx=12, pady=(2,0))
+            # --- 伺服器控制 ---
+            srv_frm = ttk.LabelFrame(self, text="本機回放伺服器"); srv_frm.pack(fill="x", padx=12, pady=6)
+            ttk.Label(srv_frm, text="Port:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+            self.port_var = tk.IntVar(value=args.port or 8000)
+            ttk.Entry(srv_frm, textvariable=self.port_var, width=10).grid(row=0, column=1, sticky="w", padx=6)
+            
+            self.btn_start = ttk.Button(srv_frm, text="啟動伺服器", command=self.start_server)
+            self.btn_start.grid(row=0, column=2, padx=6)
+            self.btn_stop = ttk.Button(srv_frm, text="停止伺服器", command=self.stop_server, state="disabled")
+            self.btn_stop.grid(row=0, column=3, padx=6)
+            self.btn_open = ttk.Button(srv_frm, text="開啟清單頁", command=lambda: webbrowser.open(f"http://127.0.0.1:{self.port_var.get()}/"), state="disabled")
+            self.btn_open.grid(row=0, column=4, padx=6)
+            
+            # --- 作者 / 單位 / 版本 資訊列（靠右，風格與舊版一致） ---
+            meta = ttk.Frame(self)
+            meta.pack(fill="x", padx=12, pady=(2, 0))
             ttk.Label(
                 meta,
-                text=f"臺中市政府警察局刑事警察大隊科技犯罪偵查隊  ｜   作者：{__author__}  ｜   版本：{__version__}",
+                text=f"{UNIT_STR}  ｜   作者：{__author__}  ｜   版本：{__version__}",
                 foreground="#555"
             ).pack(side="right")
+            
+            # --- 證據匯出 (from v2) ---
+            exp = ttk.LabelFrame(self, text="匯出證據包"); exp.pack(fill="x", padx=12, pady=6)
+            self.mode_var = tk.StringVar(value="off")
+            ttk.Radiobutton(exp, text="純離線 (Offline)", variable=self.mode_var, value="off").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+            ttk.Radiobutton(exp, text="外聯註記 (Online Augment)", variable=self.mode_var, value="on").grid(row=0, column=1, sticky="w", padx=6)
 
-            self.adv = ttk.Frame(self); self.adv.pack(fill="x", padx=12, pady=(0,6))
-            ttk.Label(self.adv, text="Cert：").grid(row=0, column=0, sticky="w")
-            self.cert_var = tk.StringVar()
-            ttk.Entry(self.adv, textvariable=self.cert_var, width=48).grid(row=0, column=1, sticky="ew", padx=6)
-            ttk.Button(self.adv, text="選擇…", command=self.choose_cert).grid(row=0, column=2, sticky="w")
+            ttk.Label(exp, text="時間戳 (ISO, 可空):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+            self.ts_var = tk.StringVar()
+            ttk.Entry(exp, textvariable=self.ts_var, width=30).grid(row=1, column=1, sticky="w", padx=6)
+            ttk.Button(exp, text="匯出", command=self.do_export).grid(row=1, column=2, padx=6)
 
-            ttk.Label(self.adv, text="Key：").grid(row=1, column=0, sticky="w", pady=(4,0))
-            self.key_var = tk.StringVar()
-            ttk.Entry(self.adv, textvariable=self.key_var, width=48).grid(row=1, column=1, sticky="ew", padx=6, pady=(4,0))
-            ttk.Button(self.adv, text="選擇…", command=self.choose_key).grid(row=1, column=2, sticky="w", pady=(4,0))
-            self.adv.grid_columnconfigure(1, weight=1)
-            self.adv.pack_forget()
+            # --- 說明 & 狀態列 ---
+            tips = ttk.LabelFrame(self, text="提示"); tips.pack(fill="both", expand=True, padx=12, pady=10)
+            txt = ("1) 匯出證據包 (Evidence Bundle) 包含: page_snapshot.html, resources/, manifest.json, hashes_sha256.txt, report.html\n"
+                   "2) 蒐證時務必停用瀏覽器快取 (Disable Cache)，並選擇 `Save all as HAR with content`。\n"
+                   "3) 對於動態/SPA網站，`基底快照` 是確保高還原度的關鍵。")
+            tk.Label(tips, text=txt, justify='left', anchor='w', wraplength=720).pack(fill="both", padx=10, pady=8)
 
-            # ===== 控制列 =====
-            ctrl = ttk.Frame(self); ctrl.pack(fill="x", padx=12, pady=10)
-            ttk.Button(ctrl, text="關於我", command=self.open_portfolio).pack(side="left", padx=(6,0))
-            ttk.Button(ctrl, text="回饋表單", command=self.open_feedback).pack(side="left")
-
-            self.btn_start = ttk.Button(ctrl, text="啟動", command=self.on_start)
-            self.btn_start.pack(side="right")
-            self.btn_stop  = ttk.Button(ctrl, text="停止", command=self.on_stop, state="disabled")
-            self.btn_stop.pack(side="right", padx=6)
-            self.btn_open  = ttk.Button(ctrl, text="開啟瀏覽器", command=self.open_browser, state="disabled")
-            self.btn_open.pack(side="right", padx=6)
-
-            # ===== 狀態列 =====
             self.status_var = tk.StringVar(
-                value=f"待命  |  版本 {__version__}  |  作者 {__author__}\n臺中市政府警察局刑事警察大隊科技犯罪偵查隊"
+                value=f"待命  |  版本 {__version__}  |  作者 {__author__}\n{UNIT_STR}"
             )
-            ttk.Label(self, textvariable=self.status_var, foreground="#444").pack(
-                side="right", fill="x", padx=12, pady=(0,10)
-            )
+            ttk.Label(
+                self,
+                textvariable=self.status_var,
+                foreground="#444",
+                anchor="center",
+                justify="center"
+            ).pack(side="bottom", fill="x", padx=12, pady=(0,10))
+            
+            # --- 自動啟動 ---
+            if args.har:
+                self.after(100, self.start_server)
 
             self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # --- Forensics helper ---
+        def choose_har(self): self.har_var.set(filedialog.askopenfilename(filetypes=[("HAR","*.har"),("All","*.*")]))
+        def choose_snap(self): self.snap_var.set(filedialog.askopenfilename(filetypes=[("HTML","*.html;*.htm"),("All","*.*")]))
+
+        def start_server(self):
+            if self.srv["httpd"]: messagebox.showinfo("提示", "伺服器已在執行。"); return
+            har = self.har_var.get().strip()
+            if not har or not os.path.exists(har): messagebox.showerror("錯誤", "請選擇有效的 HAR 檔。"); return
+            snap = self.snap_var.get().strip() or None
+            
+            def on_ready(url):
+                self.status_var.set(f"伺服器已啟動: {url}")
+                self.btn_start.config(state="disabled")
+                self.btn_stop.config(state="normal")
+                self.btn_open.config(state="normal")
+                webbrowser.open(url)
+            
+            def on_error(msg):
+                self.status_var.set(f"啟動失敗: {msg}")
+                messagebox.showerror("啟動失敗", msg)
+            
+            httpd, th = run_server(har, snap, port=self.port_var.get(), on_ready=on_ready, on_error=on_error)
+            if httpd:
+                self.srv.update({"httpd": httpd, "th": th})
+
+        def stop_server(self):
+            if self.srv["httpd"]:
+                try: self.srv["httpd"].shutdown(); self.srv["httpd"].server_close()
+                except Exception: pass
+                self.srv["httpd"] = None; self.srv["th"] = None
+                self.status_var.set(f"伺服器已停止。")
+                self.btn_start.config(state="normal")
+                self.btn_stop.config(state="disabled")
+                self.btn_open.config(state="disabled")
+
+        def do_export(self):
+            har = self.har_var.get().strip()
+            if not har or not os.path.exists(har): messagebox.showerror("錯誤", "請選擇有效的 HAR 檔。"); return
+            snap = self.snap_var.get().strip() or None
+            try:
+                state = AppState(har, snap)
+                out_dir = os.path.abspath("evidence_bundle")
+                ts = self.ts_var.get().strip()
+                Exporter(state.har, state.composer, out_dir).run(mode=self.mode_var.get(), ts_iso=iso_norm(ts) if ts else None)
+                messagebox.showinfo("完成", f"已成功匯出證據包至資料夾：\n{out_dir}")
+                os.startfile(out_dir) # Open folder
+            except Exception as e:
+                messagebox.showerror("匯出失敗", f"發生錯誤: {e}")
+
+        # --- v1 Forensic Tools Methods ---
         def open_forensic_tips(self):
-            tips = tk.Toplevel(self)
-            tips.title("取證流程教學（快速）")
-            tips.geometry("640x520")
-            tips.resizable(False, False)
-
-            txt = tk.Text(tips, wrap="word")
-            txt.pack(fill="both", expand=True, padx=12, pady=12)
-
+            tips = tk.Toplevel(self); tips.title("現場快速取證教學"); tips.geometry("660x540"); tips.resizable(False, False)
+            txt_widget = tk.Text(tips, wrap="word", padx=10, pady=10); txt_widget.pack(fill="both", expand=True)
             guide = (
                 "【現場快速蒐證建議】\n"
-                "1) 先做「螢幕錄影」或手機側錄：從畫面全貌開始，包含 URL、時間。\n"
-                "2) 儲存為 PDF：按 Ctrl+P（或列印）→ 存成 PDF，保留可閱讀的靜態截圖。\n"
-                "3) 取得 DOM 快照（Base HTML）：\n"
-                "   a. 開啟瀏覽器開發者工具（F12）→ Console 分頁。\n"
-                "   b. 先輸入：allow pasting（Edge/Chrome 若有貼上限制）。\n"
-                "   c. 貼上以下指令並 Enter：\n"
-                "      copy(document.documentElement.outerHTML);\n"
-                "   d. 這會把整頁 HTML 複製到剪貼簿。\n"
-                "4) 回到本工具 → 按「從剪貼簿存成 HTML…」→ 選擇存檔位置。\n"
-                "5) 將 HAR（若能取得）與 Base HTML 一起帶回分析；本工具可套用 Base HTML，並以 HAR 補資源。\n"
-                "\n"
-                "【注意】\n"
-                "• 本工具為『靜態回填』，不會執行 JavaScript；需要互動的內容（登入、廣告、影音）未必可完整重播。\n"
-                "• 若要模擬當時外觀，建議用「外聯補資源」模式（網路需可連外）。需完全離線則選「純本機」。\n"
+                "1) 全程螢幕錄影：從操作開始到結束，包含網址列、系統時間。\n\n"
+                "2) 儲存靜態畫面 (PDF)：按 Ctrl+P (或列印) → 另存為 PDF。\n\n"
+                "3) 取得 HAR (含內容)：\n"
+                "   a. 開啟開發者工具 (F12) → Network (網路) 分頁。\n"
+                "   b. 勾選 ☑ Disable cache (停用快取)。\n"
+                "   c. 操作網頁，重現要取證的畫面。\n"
+                "   d. 在請求列表上按右鍵 → Save all as HAR with content。\n\n"
+                "4) 取得 DOM 快照 (高度建議)：\n"
+                "   a. 在開發者工具中切換到 Console (主控台) 分頁。\n"
+                "   b. (若瀏覽器阻擋貼上) 先輸入 `allow pasting` 並按 Enter。\n"
+                "   c. 貼上指令 `copy(document.documentElement.outerHTML);` 並按 Enter。\n"
+                "   d. 回到本工具，按「從剪貼簿存成 HTML...」儲存。\n\n"
+                "5) 將 HAR 和 DOM 快照檔載入本工具，進行回放或匯出證據包。"
             )
-            txt.insert("1.0", guide)
-            txt.config(state="disabled")
-
-            btns = ttk.Frame(tips); btns.pack(fill="x", padx=12, pady=(0,12))
-            ttk.Button(btns, text="複製 DOM 指令", command=lambda: self.copy_to_clipboard('copy(document.documentElement.outerHTML);')).pack(side="left")
-            ttk.Button(btns, text="關閉", command=tips.destroy).pack(side="right")
+            txt_widget.insert("1.0", guide); txt_widget.config(state="disabled")
+            ttk.Button(tips, text="關閉", command=tips.destroy).pack(pady=10)
 
         def copy_to_clipboard(self, s: str):
             try:
-                self.clipboard_clear()
-                self.clipboard_append(s)
-                self.update()  # 讓剪貼簿生效
+                self.clipboard_clear(); self.clipboard_append(s); self.update()
                 messagebox.showinfo("已複製", "指令已複製到剪貼簿。\n請到瀏覽器 Console 貼上執行。")
-            except Exception as e:
-                messagebox.showerror("複製失敗", f"無法複製到剪貼簿：{e}")
+            except Exception as e: messagebox.showerror("複製失敗", f"無法寫入剪貼簿: {e}")
 
         def save_clipboard_to_html(self):
-            # 嘗試讀出純文字
-            try:
-                txt = self.clipboard_get()
-            except Exception as e:
-                from tkinter import messagebox
-                messagebox.showerror("讀取剪貼簿失敗", f"無法讀取剪貼簿文字：{e}")
-                return
+            try: txt = self.clipboard_get()
+            except Exception: messagebox.showerror("讀取失敗", "無法讀取剪貼簿內容。"); return
             if not txt or "<html" not in txt.lower():
-                from tkinter import messagebox
-                messagebox.showwarning("內容看起來不像 HTML", "剪貼簿內容似乎不是完整 HTML。\n請確認已在 Console 執行 copy(document.documentElement.outerHTML);")
-                # 仍允許存檔
+                messagebox.showwarning("內容警告", "剪貼簿內容似乎不是完整 HTML，請確認已正確執行指令。")
 
-            from tkinter import filedialog
-            p = filedialog.asksaveasfilename(
-                defaultextension=".html",
-                filetypes=[("HTML files", "*.html;*.htm"), ("All files", "*.*")],
-                title="儲存從剪貼簿取得的 HTML"
-            )
-            if not p:
-                return
+            p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML","*.html;*.htm")], title="儲存 DOM 快照")
+            if not p: return
             try:
-                with open(p, "w", encoding="utf-8", newline="") as f:
-                    f.write(txt)
-                self.base_var.set(p)
-                from tkinter import messagebox
-                messagebox.showinfo("已儲存", f"已將剪貼簿內容存為：\n{p}\n\n已自動填入『基底快照』欄位。")
-            except Exception as e:
-                from tkinter import messagebox
-                messagebox.showerror("儲存失敗", f"寫入檔案失敗：{e}")
-
-        # --- GUI helpers ---
-        def choose_har(self):
-            from tkinter import filedialog
-            p = filedialog.askopenfilename(filetypes=[("HAR files", "*.har"), ("All files", "*.*")])
-            if p: self.har_var.set(p)
-
-        def choose_base_html(self):
-            from tkinter import filedialog
-            p = filedialog.askopenfilename(filetypes=[("HTML files", "*.html;*.htm"), ("All files", "*.*")])
-            if p: self.base_var.set(p)
-
-        def choose_cert(self):
-            from tkinter import filedialog
-            p = filedialog.askopenfilename(filetypes=[("PEM certificate", "*.pem"), ("All files", "*.*")])
-            if p: self.cert_var.set(p)
-
-        def choose_key(self):
-            from tkinter import filedialog
-            p = filedialog.askopenfilename(filetypes=[("PEM private key", "*.pem;*.key"), ("All files", "*.*")])
-            if p: self.key_var.set(p)
-
-        def toggle_adv(self):
-            if self.show_adv.get():
-                self.adv.pack(fill="x", padx=12, pady=(0,6))
-            else:
-                self.adv.pack_forget()
-
-        def on_start(self):
-            if self.httpd: return
-            har = self.har_var.get().strip()
-            if not har or not os.path.isfile(har):
-                from tkinter import messagebox
-                messagebox.showerror("錯誤", "請選擇有效的 HAR 檔案"); return
-            try:
-                port = int(self.port_var.get().strip() or "3000")
-            except ValueError:
-                from tkinter import messagebox
-                messagebox.showerror("錯誤", "Port 必須是數字"); return
-
-            cert = self.cert_var.get().strip() if self.show_adv.get() and self.cert_var.get().strip() else None
-            key  = self.key_var.get().strip()  if self.show_adv.get() and self.key_var.get().strip()  else None
-            if (cert and not key) or (key and not cert):
-                from tkinter import messagebox
-                messagebox.showerror("錯誤", "若使用 HTTPS，請同時提供憑證與金鑰（PEM）"); return
-
-            base_html_path = self.base_var.get().strip() or None
-
-            def on_ready(scheme):
-                self.scheme = scheme
-                self.status_var.set(f"伺服器已啟動：{scheme}://localhost:{port}   （清單：/；偵錯：/__debug）")
-                self.btn_start.configure(state="disabled")
-                self.btn_stop.configure(state="normal")
-                self.btn_open.configure(state="normal")
-                webbrowser.open(f"{scheme}://localhost:{port}/")
-
-            def on_error(msg):
-                from tkinter import messagebox
-                self.status_var.set(f"錯誤：{msg}")
-                messagebox.showerror("啟動失敗", msg)
-
-            out = run_server(har, port=port, cert=cert, key=key, on_ready=on_ready, on_error=on_error, base_html_path=base_html_path)
-            if out is None: return
-            self.httpd, self.srv_thread, self.scheme = out[0], out[1], out[2]
-
-        def on_stop(self):
-            if not self.httpd: return
-            try:
-                self.httpd.shutdown()
-                self.httpd.server_close()
-            except Exception:
-                pass
-            self.httpd = None
-            self.srv_thread = None
-            self.btn_start.configure(state="normal" if self.har_var.get().strip() else "disabled")
-            self.btn_stop.configure(state="disabled")
-            self.btn_open.configure(state="disabled")
-            self.status_var.set(f"已停止  |  版本 {__version__}  |  作者 {__author__}\n臺中市政府警察局刑事警察大隊科技犯罪偵查隊")
-
-        def open_browser(self):
-            if not self.httpd: return
-            try:
-                port = int(self.port_var.get().strip() or "3000")
-            except ValueError:
-                port = 3000
-            webbrowser.open(f"{self.scheme}://localhost:{port}/")
-
-        def open_portfolio(self):
-            webbrowser.open("https://chiakai-chang.github.io/CKTools/")
-
-        def open_feedback(self):
-            webbrowser.open("https://forms.gle/euDVcKwk7QsiHgsz8")
+                with open(p, "w", encoding="utf-8") as f: f.write(txt)
+                self.snap_var.set(p)
+                messagebox.showinfo("儲存成功", f"已將剪貼簿內容存為檔案，並自動填入「基底快照」欄位:\n{p}")
+            except Exception as e: messagebox.showerror("儲存失敗", f"寫入檔案時發生錯誤: {e}")
 
         def on_close(self):
-            try: self.on_stop()
-            finally: self.destroy()
+            self.stop_server()
+            self.destroy()
 
-    App().mainloop()
+    app = App(args)
+    app.mainloop()
 
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description=f"Minimal HAR replay server (GUI + CLI)  v{__version__}  by {__author__}")
+    ap = argparse.ArgumentParser(description=f"HAR Replay Pro {__version__} — Evidence-Grade Replayer")
     ap.add_argument("--har", help="Path to HAR file")
-    ap.add_argument("--port", type=int, default=3000)
-    ap.add_argument("--cert", help="PEM cert for HTTPS (advanced)")
-    ap.add_argument("--key", help="PEM key for HTTPS (advanced)")
-    ap.add_argument("--base-html", help="Path to base HTML snapshot (DOM outerHTML)")
-    ap.add_argument("--gui", action="store_true", help="Force GUI mode")
+    ap.add_argument("--snapshot", help="Path to DOM snapshot HTML (optional)")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--headless", action="store_true", help="Run without GUI (web UI only)")
     args = ap.parse_args()
 
-    if args.gui or not args.har:
-        try: start_gui()
-        except KeyboardInterrupt: pass
+    if args.headless:
+        if not args.har or not os.path.exists(args.har):
+            print("[!] Headless 模式需要 --har 參數指定 HAR 檔路徑。"); sys.exit(1)
+        
+        def on_ready(url): print(f"[*] 無頭模式伺服器已啟動: {url}"); print("[*] 按 Ctrl+C 停止。")
+        def on_error(msg): print(f"[!] 伺服器錯誤: {msg}"); sys.exit(1)
+            
+        httpd, th = run_server(args.har, args.snapshot, args.port, on_ready, on_error)
+        if th:
+            try: th.join()
+            except KeyboardInterrupt: print("\n[*] 正在關閉伺服器..."); httpd.shutdown()
         return
 
-    out = run_server(args.har, port=args.port, cert=args.cert, key=args.key, base_html_path=args.base_html)
-    if out is None: sys.exit(1)
-    httpd, t, scheme = out
-    print(f"[HAR Replay v{__version__}] Serving on {scheme}://localhost:{args.port}  (/ , /__debug)")
-    try:
-        t.join()
-    except KeyboardInterrupt:
-        httpd.shutdown(); httpd.server_close()
+    start_gui(args)
 
 if __name__ == "__main__":
     main()
